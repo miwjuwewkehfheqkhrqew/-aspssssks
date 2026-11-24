@@ -1,20 +1,77 @@
-name: Graphical macOS Tahoe Desktop
-on: workflow_dispatch
+name: macOS Hosted Desktop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   macos-desktop:
     runs-on: macos-latest
+    timeout-minutes: 360
+
     steps:
-      - name: Enable macOS Screen Sharing (VNC)
+      - name: Enable and verify Screen Sharing
+        shell: bash
+        env:
+          MACOS_VNC_PASSWORD: ${{ secrets.MACOS_VNC_PASSWORD }}
         run: |
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes -clientopts -setvncpw -vncpw mysecret -restart -agent -privs -all
+          set -euo pipefail
+          if [[ -z "$MACOS_VNC_PASSWORD" ]]; then
+            echo "MACOS_VNC_PASSWORD repository secret is required."
+            exit 1
+          fi
+          if [[ ${#MACOS_VNC_PASSWORD} -gt 8 ]]; then
+            echo "MACOS_VNC_PASSWORD must be 8 characters or fewer."
+            exit 1
+          fi
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate \
+            -configure -access -on \
+            -clientopts -setvnclegacy -vnclegacy yes \
+            -clientopts -setvncpw -vncpw "$MACOS_VNC_PASSWORD" \
+            -restart -agent -privs -all
+          for attempt in {1..30}; do
+            if nc -z localhost 5900; then
+              break
+            fi
+            sleep 1
+          done
+          if ! nc -z localhost 5900; then
+            echo "Screen Sharing did not start listening on port 5900."
+            exit 1
+          fi
 
-      - name: Install noVNC and Cloudflare Tunnel
+      - name: Install desktop proxy
+        shell: bash
         run: |
-          brew install novnc cloudflared
+          set -euo pipefail
+          brew install cloudflared
+          python3 -m venv "$RUNNER_TEMP/novnc-venv"
+          "$RUNNER_TEMP/novnc-venv/bin/python" -m pip install --upgrade pip websockify
+          git clone --depth 1 --branch v1.6.0 https://github.com/novnc/noVNC.git "$RUNNER_TEMP/noVNC"
 
-      - name: Start Desktop Stream
+      - name: Start noVNC and Cloudflare Tunnel
+        shell: bash
         run: |
-          novnc --vnc localhost:5900 --listen 6080 &
-          sleep 3
+          set -euo pipefail
+          export PATH="$RUNNER_TEMP/novnc-venv/bin:$PATH"
+          "$RUNNER_TEMP/noVNC/utils/novnc_proxy" --vnc localhost:5900 --listen 6080 &
+          novnc_pid=$!
+          trap 'kill "$novnc_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..30}; do
+            if nc -z localhost 6080; then
+              break
+            fi
+            if ! kill -0 "$novnc_pid" 2>/dev/null; then
+              echo "noVNC proxy exited before it started."
+              exit 1
+            fi
+            sleep 1
+          done
+          if ! nc -z localhost 6080; then
+            echo "noVNC did not start on port 6080."
+            exit 1
+          fi
           cloudflared tunnel --url http://localhost:6080
